@@ -344,11 +344,11 @@ pub fn route_data(
                             } else {
                                 inc_stats!(outface, tx, admin, msg.payload);
                             }
-                            tracing::info!("[msg_id={}] Routing push to single destination, key_expr: {}, reliability: {:?}, congestion_control: {:?}", msg_id, key_expr, reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Routing push to single destination {}, key_expr: {}, reliability: {:?}, congestion_control: {:?}", msg_id, outface, key_expr, reliability, msg.ext_qos.get_congestion_control());
                             msg.wire_expr = key_expr.into();
                             msg.ext_nodeid = ext::NodeIdType { node_id: *context };
                             outface.primitives.send_push(msg, reliability);
-                            tracing::info!("[msg_id={}] Push sent, reliability: {:?}, congestion_control: {:?}", msg_id, reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Push sent to {}, reliability: {:?}, congestion_control: {:?}", msg_id, outface, reliability, msg.ext_qos.get_congestion_control());
                         }
                     } else {
                         let route = route
@@ -370,7 +370,7 @@ pub fn route_data(
                             } else {
                                 inc_stats!(outface, tx, admin, msg.payload)
                             }
-                            tracing::info!("[msg_id={}] Sending push for key_expr: {}, reliability: {:?}, congestion_control: {:?}", msg_id, key_expr, reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Sending push to {}, key_expr: {}, reliability: {:?}, congestion_control: {:?}", msg_id, outface, key_expr, reliability, msg.ext_qos.get_congestion_control());
                             outface.primitives.send_push(
                                 &mut Push {
                                     wire_expr: key_expr,
@@ -381,7 +381,7 @@ pub fn route_data(
                                 },
                                 reliability,
                             );
-                            tracing::info!("[msg_id={}] Push sent, reliability: {:?}, congestion_control: {:?}", msg_id, reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Push sent to {}, reliability: {:?}, congestion_control: {:?}", msg_id, outface, reliability, msg.ext_qos.get_congestion_control());
                         }
                     }
                 }
