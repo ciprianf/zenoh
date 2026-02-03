@@ -356,6 +356,7 @@ pub fn route_data(
                             .collect::<Vec<Direction>>();
 
                         drop(tables);
+                        tracing::info!("New message received, routing to {} destinations, reliability: {:?}", route.len(), reliability);
                         for (outface, key_expr, context) in route {
                             #[cfg(feature = "stats")]
                             if !admin {
@@ -374,7 +375,7 @@ pub fn route_data(
                                 },
                                 reliability,
                             );
-                            tracing::info!("Push sent for key_expr: {}, reliability: {:?}", key_expr, reliability);
+                            tracing::info!("Push sent, reliability: {:?}", reliability);
                         }
                     }
                 }
