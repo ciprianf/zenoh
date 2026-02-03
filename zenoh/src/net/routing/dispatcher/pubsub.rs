@@ -363,7 +363,7 @@ pub fn route_data(
                             } else {
                                 inc_stats!(outface, tx, admin, msg.payload)
                             }
-                            tracing::info!("Sending push for key_expr: {}, reliability: {:?}", key_expr, reliability)
+                            tracing::info!("Sending push for key_expr: {}, reliability: {:?}", key_expr, reliability);
                             outface.primitives.send_push(
                                 &mut Push {
                                     wire_expr: key_expr,
@@ -373,8 +373,8 @@ pub fn route_data(
                                     payload: msg.payload.clone(),
                                 },
                                 reliability,
-                            )
-                            tracing::info!("Push sent for key_expr: {}, reliability: {:?}", key_expr, reliability)
+                            );
+                            tracing::info!("Push sent for key_expr: {}, reliability: {:?}", key_expr, reliability);
                         }
                     }
                 }
