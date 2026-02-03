@@ -12,7 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
 
 use zenoh_core::zread;
 use zenoh_protocol::{
@@ -34,6 +34,9 @@ use crate::{
         router::get_or_set_route,
     },
 };
+
+/// Counter for generating unique message IDs for debugging
+static MSG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Copy, Clone)]
 pub(crate) struct SubscriberInfo;
@@ -326,6 +329,7 @@ pub fn route_data(
 
                 if !route.is_empty() {
                     treat_timestamp!(&tables.hlc, msg.payload, tables.drop_future_timestamp);
+                    let msg_id = MSG_COUNTER.fetch_add(1, Ordering::Relaxed);
 
                     if route.len() == 1 {
                         let (outface, key_expr, context) = route.iter().next().unwrap();
@@ -340,11 +344,11 @@ pub fn route_data(
                             } else {
                                 inc_stats!(outface, tx, admin, msg.payload);
                             }
-                            tracing::info!("New message received (single destination), routing to key_expr: {}, reliability: {:?}, congestion_control: {:?}", key_expr, reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Routing push to single destination, key_expr: {}, reliability: {:?}, congestion_control: {:?}", msg_id, key_expr, reliability, msg.ext_qos.get_congestion_control());
                             msg.wire_expr = key_expr.into();
                             msg.ext_nodeid = ext::NodeIdType { node_id: *context };
                             outface.primitives.send_push(msg, reliability);
-                            tracing::info!("Push sent, reliability: {:?}, congestion_control: {:?}", reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Push sent, reliability: {:?}, congestion_control: {:?}", msg_id, reliability, msg.ext_qos.get_congestion_control());
                         }
                     } else {
                         let route = route
@@ -358,7 +362,7 @@ pub fn route_data(
                             .collect::<Vec<Direction>>();
 
                         drop(tables);
-                        tracing::info!("New message received, routing to {} destinations, reliability: {:?}, congestion_control: {:?}", route.len(), reliability, msg.ext_qos.get_congestion_control());
+                        tracing::info!("[msg_id={}] Routing push to {} destinations, reliability: {:?}, congestion_control: {:?}", msg_id, route.len(), reliability, msg.ext_qos.get_congestion_control());
                         for (outface, key_expr, context) in route {
                             #[cfg(feature = "stats")]
                             if !admin {
@@ -366,7 +370,7 @@ pub fn route_data(
                             } else {
                                 inc_stats!(outface, tx, admin, msg.payload)
                             }
-                            tracing::info!("Sending push for key_expr: {}, reliability: {:?}, congestion_control: {:?}", key_expr, reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Sending push for key_expr: {}, reliability: {:?}, congestion_control: {:?}", msg_id, key_expr, reliability, msg.ext_qos.get_congestion_control());
                             outface.primitives.send_push(
                                 &mut Push {
                                     wire_expr: key_expr,
@@ -377,7 +381,7 @@ pub fn route_data(
                                 },
                                 reliability,
                             );
-                            tracing::info!("Push sent, reliability: {:?}, congestion_control: {:?}", reliability, msg.ext_qos.get_congestion_control());
+                            tracing::info!("[msg_id={}] Push sent, reliability: {:?}, congestion_control: {:?}", msg_id, reliability, msg.ext_qos.get_congestion_control());
                         }
                     }
                 }
