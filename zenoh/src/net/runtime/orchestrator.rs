@@ -795,20 +795,35 @@ impl Runtime {
                     self.get_global_connect_timeout(),
                     self.get_connect_retry_config(&peer)
                 );
-                match self.manager().open_transport_unicast(peer.clone()).await {
+                let result = match self
+                    .manager()
+                    .open_transport_unicast(peer.clone())
+                    .await
+                {
                     Ok(transport) => {
-                        tracing::debug!("Successfully connected to configured peer {}", peer);
-                        if let Ok(Some(orch_transport)) = transport.get_callback() {
-                            if let Some(orch_transport) = orch_transport
+                        // REPRODUCER: widen the race window — remove after testing
+                        tracing::warn!("REPRODUCER: sleeping 5s to widen race window...");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        (|| -> ZResult<_> {
+                            let zid = transport.get_zid()?;
+                            let cb = transport
+                                .get_callback()?
+                                .ok_or_else(|| zerror!("Transport closed immediately"))?;
+                            let session = cb
                                 .as_any()
                                 .downcast_ref::<super::RuntimeSession>()
-                            {
-                                zwrite!(orch_transport.endpoints).insert(peer);
-                            }
-                        }
-                        if let Ok(zid) = transport.get_zid() {
-                            connected_peers.push(zid);
-                        }
+                                .ok_or_else(|| zerror!("Unexpected callback type"))?;
+                            zwrite!(session.endpoints).insert(peer.clone());
+                            Ok(zid)
+                        })()
+                    }
+                    Err(e) => Err(e),
+                };
+
+                match result {
+                    Ok(zid) => {
+                        tracing::debug!("Successfully connected to configured peer {}", peer);
+                        connected_peers.push(zid);
                         if stop_after_first_connection {
                             break;
                         }
