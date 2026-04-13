@@ -795,11 +795,16 @@ impl Runtime {
                     self.get_global_connect_timeout(),
                     self.get_connect_retry_config(&peer)
                 );
-                let result = self
+                let result = match self
                     .manager()
                     .open_transport_unicast(peer.clone())
                     .await
-                    .and_then(|transport| -> ZResult<_> {
+                {
+                    Ok(transport) => {
+                        // REPRODUCER: widen the race window — remove after testing
+                        tracing::warn!("REPRODUCER: sleeping 5s to widen race window...");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        (|| -> ZResult<_> {
                         let zid = transport.get_zid()?;
                         let cb = transport
                             .get_callback()?
