@@ -4,6 +4,20 @@
 
 Two zenoh routers (A and B) deployed on separate machines connected via WiFi. Router A has `connect.endpoints` pointing to Router B using a hostname. Router B has no connect endpoints pointing to A. When WiFi drops and reconnects, approximately 1 in 100 times the routers permanently fail to reconnect.
 
+# Reproducing the issue
+
+In one terminal run router B:
+
+`cd demo && RUST_LOG=zenoh::net::runtime::orchestrator=debug cargo run --bin router_b`
+
+In the second terminal run router A:
+
+`cd demo && RUST_LOG=zenoh::net::runtime::orchestrator=debug cargo run --bin router_a`
+
+After router A starts, kill router B fast (within 5s window) by pressing `Ctrl+C`
+
+Wait 5 seconds and then start router B again. The router B never gets any message. Permanent disconnect.
+
 ## Root Cause
 
 A race condition in `zenoh/src/net/runtime/orchestrator.rs` in the `peers_connector_retry` function (line ~798).
