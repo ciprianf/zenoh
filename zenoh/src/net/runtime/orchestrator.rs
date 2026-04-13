@@ -798,6 +798,9 @@ impl Runtime {
                 match self.manager().open_transport_unicast(peer.clone()).await {
                     Ok(transport) => {
                         tracing::debug!("Successfully connected to configured peer {}", peer);
+                        // REPRODUCER: widen the race window — remove after testing
+                        tracing::warn!("REPRODUCER: sleeping 5s to widen race window...");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         if let Ok(Some(orch_transport)) = transport.get_callback() {
                             if let Some(orch_transport) = orch_transport
                                 .as_any()
