@@ -805,17 +805,20 @@ impl Runtime {
                         tracing::warn!("REPRODUCER: sleeping 5s to widen race window...");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         (|| -> ZResult<_> {
-                        let zid = transport.get_zid()?;
-                        let cb = transport
-                            .get_callback()?
-                            .ok_or_else(|| zerror!("Transport closed immediately"))?;
-                        let session = cb
-                            .as_any()
-                            .downcast_ref::<super::RuntimeSession>()
-                            .ok_or_else(|| zerror!("Unexpected callback type"))?;
-                        zwrite!(session.endpoints).insert(peer.clone());
-                        Ok(zid)
-                    });
+                            let zid = transport.get_zid()?;
+                            let cb = transport
+                                .get_callback()?
+                                .ok_or_else(|| zerror!("Transport closed immediately"))?;
+                            let session = cb
+                                .as_any()
+                                .downcast_ref::<super::RuntimeSession>()
+                                .ok_or_else(|| zerror!("Unexpected callback type"))?;
+                            zwrite!(session.endpoints).insert(peer.clone());
+                            Ok(zid)
+                        })()
+                    }
+                    Err(e) => Err(e),
+                };
 
                 match result {
                     Ok(zid) => {
