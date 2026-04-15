@@ -12,75 +12,51 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::Parser;
-use zenoh::{key_expr::KeyExpr, Config};
+use zenoh::Config;
 use zenoh_examples::CommonArgs;
+
+const PAYLOAD_SIZE: usize = 1_024 * 1_024; // 1MB
 
 #[tokio::main]
 async fn main() {
-    // initiate logging
     zenoh::init_log_from_env_or("error");
-
-    let (config, key_expr, payload, complete) = parse_args();
+    let args = Args::parse();
+    let mut config: Config = args.common.into();
+    config
+        .insert_json5("transport/shared_memory/enabled", "true")
+        .unwrap();
 
     println!("Opening session...");
     let session = zenoh::open(config).await.unwrap();
 
-    println!("Declaring Queryable on '{key_expr}'...");
+    println!("Declaring Queryable on 'health-status'...");
     let queryable = session
-        .declare_queryable(&key_expr)
-        // // By default queryable receives queries from a FIFO.
-        // // Uncomment this line to use a ring channel instead.
-        // // More information on the ring channel are available in the z_pull example.
-        // .with(zenoh::handlers::RingChannel::default())
-        .complete(complete)
+        .declare_queryable("health-status")
+        .complete(true)
         .await
         .unwrap();
 
+    // Build a 1MB reply payload
+    let reply_payload = vec![b'R'; PAYLOAD_SIZE];
+
     println!("Press CTRL-C to quit...");
     while let Ok(query) = queryable.recv_async().await {
-        match query.payload() {
-            None => println!(">> [Queryable ] Received Query '{}'", query.selector()),
-            Some(query_payload) => {
-                // Refer to z_bytes.rs to see how to deserialize different types of message
-                let deserialized_payload = query_payload
-                    .try_to_string()
-                    .unwrap_or_else(|e| e.to_string().into());
-                println!(
-                    ">> [Queryable ] Received Query '{}' with payload '{}'",
-                    query.selector(),
-                    deserialized_payload
-                )
-            }
-        }
+        let query_len = query.payload().map_or(0, |p| p.len());
         println!(
-            ">> [Queryable ] Responding ('{}': '{}')",
-            key_expr.as_str(),
-            payload,
+            ">> [Queryable] Received Query '{}' ({} bytes)",
+            query.selector(),
+            query_len,
         );
-        // Refer to z_bytes.rs to see how to serialize different types of message
+        println!(">> [Queryable] Responding with 1MB payload...");
         query
-            .reply(key_expr.clone(), payload.clone())
+            .reply("health-status", reply_payload.clone())
             .await
-            .unwrap_or_else(|e| println!(">> [Queryable ] Error sending reply: {e}"));
+            .unwrap_or_else(|e| println!(">> [Queryable] Error sending reply: {e}"));
     }
 }
 
-#[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Parser, Clone, Debug)]
 struct Args {
-    #[arg(short, long, default_value = "demo/example/zenoh-rs-queryable")]
-    /// The key expression matching queries to reply to.
-    key: KeyExpr<'static>,
-    #[arg(short, long, default_value = "Queryable from Rust!")]
-    /// The payload to reply to queries.
-    payload: String,
-    #[arg(long)]
-    /// Declare the queryable as complete w.r.t. the key expression.
-    complete: bool,
     #[command(flatten)]
     common: CommonArgs,
-}
-
-fn parse_args() -> (Config, KeyExpr<'static>, String, bool) {
-    let args = Args::parse();
-    (args.common.into(), args.key, args.payload, args.complete)
 }
