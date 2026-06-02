@@ -72,7 +72,7 @@ impl TransportUnicastUniversal {
         match_.full.or(match_.partial).or(match_.any)
     }
 
-    fn handle_push_result(
+    pub(super) fn handle_push_result(
         &self,
         msg: NetworkMessageRef,
         pushed: bool,
@@ -146,7 +146,6 @@ impl TransportUnicastUniversal {
             .get(transport_link_index)
             .expect("transport link index should be valid");
 
-        let pipeline = transport_link.pipeline.clone();
         tracing::trace!(
             "Scheduled {:?} for transmission to {} ({})",
             msg,
@@ -159,6 +158,7 @@ impl TransportUnicastUniversal {
 
         #[cfg(feature = "unstable")]
         if msg.congestion_control() == CongestionControl::BlockFirst {
+            let pipeline = transport_link.pipeline.clone();
             let priority = msg.priority();
             if transport_link.block_first_waiters[priority as usize]
                 .wait_timeout(self.manager.config.wait_before_drop)
@@ -188,19 +188,27 @@ impl TransportUnicastUniversal {
             return Ok(true);
         }
 
-        // Drop the guard before the push_zenoh_message since
-        // the link could be congested and this operation could
-        // block for fairly long time
+        // Enqueue the message into the link's per-priority egress queue using a
+        // drop-oldest overflow policy. This never blocks the ingress task: a
+        // dedicated per-link drain task pulls from the queue and performs the
+        // actual (potentially blocking) pipeline push and socket write, so a
+        // slow subscriber's congestion stays isolated to its own link instead
+        // of stalling delivery to every other link.
+        let priority = msg.priority();
+        let owned = NetworkMessageExt::to_owned(&msg);
+        let tx_queue = transport_link.tx_queue.clone();
+
+        // Drop the guard before enqueueing; the slot is not contended for long.
         drop(transport_links);
 
-        let pushed = pipeline.push_network_message(msg)?;
-        self.handle_push_result(
-            msg,
-            pushed,
-            #[cfg(feature = "stats")]
-            stats,
-        );
-        Ok(pushed)
+        let evicted = tx_queue.push_drop_oldest(priority, owned);
+        #[cfg(feature = "stats")]
+        if let Some(dropped) = &evicted {
+            stats.tx_observe_congestion(dropped.as_ref());
+        }
+        #[cfg(not(feature = "stats"))]
+        let _ = evicted;
+        Ok(true)
     }
 }
 

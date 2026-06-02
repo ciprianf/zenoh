@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::Priority,
+    network::NetworkMessageExt,
     transport::{KeepAlive, TransportMessage},
 };
 use zenoh_result::{bail, zerror, ZResult};
@@ -35,7 +36,7 @@ use zenoh_sync::RecyclingObjectPool;
 use zenoh_sync::{event, Notifier, Waiter};
 use zenoh_task::TaskController;
 
-use super::transport::TransportUnicastUniversal;
+use super::{transport::TransportUnicastUniversal, tx_queue::LinkTxQueues};
 use crate::{
     common::{
         batch::{BatchConfig, RBatch},
@@ -54,6 +55,10 @@ pub(super) struct TransportLinkUnicastUniversal {
     pub(super) link: TransportLinkUnicast,
     // The transmission pipeline
     pub(super) pipeline: TransmissionPipelineProducer,
+    // The per-priority drop-oldest egress queue feeding the pipeline. Producers
+    // (ingress tasks) enqueue without blocking; the per-link drain task is the
+    // sole consumer that pushes into the pipeline.
+    pub(super) tx_queue: Arc<LinkTxQueues>,
     // The task handling substruct
     task_controller: TaskController,
     #[cfg(feature = "unstable")]
@@ -119,6 +124,7 @@ impl TransportLinkUnicastUniversal {
         let result = Self {
             link,
             pipeline: producer,
+            tx_queue: Arc::new(LinkTxQueues::new()),
             task_controller: TaskController::default(),
             #[cfg(feature = "unstable")]
             block_first_notifiers: block_first_notifiers.try_into().ok().unwrap(),
@@ -137,6 +143,34 @@ impl TransportLinkUnicastUniversal {
         consumer: TransmissionPipelineConsumer,
         keep_alive: Duration,
     ) {
+        // Spawn the per-link drain (serializer) task. It is the sole consumer of
+        // the drop-oldest egress queue and the only writer into the pipeline,
+        // which preserves per-priority sequence-number ordering. It runs on a
+        // blocking thread because `push_network_message` may block on a
+        // congested pipeline; that blocking is now isolated to this link.
+        {
+            let queue = self.tx_queue.clone();
+            let pipeline = self.pipeline.clone();
+            let transport = transport.clone();
+            #[cfg(feature = "stats")]
+            let stats = self.stats.clone();
+            zenoh_runtime::ZRuntime::TX.spawn_blocking(move || {
+                while let Some(msg) = queue.pop_blocking() {
+                    let msg = msg.as_ref();
+                    match pipeline.push_network_message(msg) {
+                        Ok(pushed) => transport.handle_push_result(
+                            msg,
+                            pushed,
+                            #[cfg(feature = "stats")]
+                            stats.clone(),
+                        ),
+                        // The pipeline (and transport) is gone: stop draining.
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
         // Spawn the TX task
         let mut tx = self.link.tx();
         #[cfg(feature = "stats")]
@@ -219,6 +253,8 @@ impl TransportLinkUnicastUniversal {
     pub(super) async fn close(self) -> ZResult<()> {
         tracing::trace!("{}: closing", self.link);
         self.task_controller.terminate_all_async().await;
+        // Wake and stop the drain task, then disable the pipeline.
+        self.tx_queue.close();
         self.pipeline.disable();
 
         self.link.close(None).await
