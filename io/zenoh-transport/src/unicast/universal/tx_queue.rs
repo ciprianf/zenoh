@@ -13,7 +13,10 @@
 //
 use std::{
     collections::VecDeque,
-    sync::{Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Condvar, LazyLock, Mutex,
+    },
 };
 
 use zenoh_protocol::{core::Priority, network::NetworkMessage};
@@ -23,7 +26,29 @@ use zenoh_protocol::{core::Priority, network::NetworkMessage};
 /// This bounds how many messages can be buffered per priority before the
 /// drop-oldest policy starts evicting the staleest message. It is a simple
 /// tunable for the prototype.
-const CAPACITY_PER_PRIORITY: usize = 64;
+///
+/// Configurable at runtime via the `ZENOH_DROP_OLDEST_CAPACITY` env variable
+/// (defaults to 64). A value of 0 is treated as 1.
+static CAPACITY_PER_PRIORITY: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ZENOH_DROP_OLDEST_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1)
+});
+
+/// TEMP: only print one eviction marker every `EVICTION_LOG_EVERY` evictions to
+/// avoid spamming under sustained load. Remove with the markers when done.
+///
+/// Configurable at runtime via the `ZENOH_DROP_OLDEST_LOG_EVERY` env variable
+/// (defaults to 1000). A value of 0 is treated as 1 (log every eviction).
+static EVICTION_LOG_EVERY: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("ZENOH_DROP_OLDEST_LOG_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1000)
+        .max(1)
+});
 
 struct Inner {
     /// One queue per priority, indexed by `priority as usize`
@@ -48,11 +73,13 @@ pub(super) struct LinkTxQueues {
     inner: Mutex<Inner>,
     not_empty: Condvar,
     capacity: usize,
+    // TEMP: running count of evicted messages, used to rate-limit the debug print.
+    evicted_count: AtomicU64,
 }
 
 impl LinkTxQueues {
     pub(super) fn new() -> Self {
-        Self::with_capacity(CAPACITY_PER_PRIORITY)
+        Self::with_capacity(*CAPACITY_PER_PRIORITY)
     }
 
     pub(super) fn with_capacity(capacity: usize) -> Self {
@@ -67,6 +94,7 @@ impl LinkTxQueues {
             }),
             not_empty: Condvar::new(),
             capacity,
+            evicted_count: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +122,18 @@ impl LinkTxQueues {
         queue.push_back(msg);
         drop(inner);
         self.not_empty.notify_one();
+        if evicted.is_some() {
+            // TEMP marker to confirm the drop-oldest policy is actually
+            // triggering under load. Rate-limited to avoid spamming. Remove
+            // when done.
+            let total = self.evicted_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if (total - 1) % *EVICTION_LOG_EVERY == 0 {
+                eprintln!(
+                    ">>> [drop-oldest TX queue] evicted oldest message at priority {priority:?} (queue full, capacity {}); total evicted so far: {total}",
+                    self.capacity
+                );
+            }
+        }
         evicted
     }
 

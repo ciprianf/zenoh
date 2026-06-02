@@ -152,9 +152,13 @@ impl TransportLinkUnicastUniversal {
             let queue = self.tx_queue.clone();
             let pipeline = self.pipeline.clone();
             let transport = transport.clone();
+            let dst = self.link.link.get_dst().to_string();
             #[cfg(feature = "stats")]
             let stats = self.stats.clone();
             zenoh_runtime::ZRuntime::TX.spawn_blocking(move || {
+                // TEMP marker to confirm the per-priority drop-oldest egress
+                // queue code path is compiled in and running. Remove when done.
+                eprintln!(">>> [drop-oldest TX queue] drain task started for link {dst}");
                 while let Some(msg) = queue.pop_blocking() {
                     let msg = msg.as_ref();
                     match pipeline.push_network_message(msg) {
