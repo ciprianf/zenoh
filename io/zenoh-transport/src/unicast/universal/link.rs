@@ -12,6 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{
+    collections::VecDeque,
     future::poll_fn,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,13 +28,16 @@ use tokio_util::sync::CancellationToken;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::Priority,
+    network::{NetworkMessage, NetworkMessageExt},
     transport::{KeepAlive, TransportMessage},
 };
 use zenoh_result::{bail, zerror, ZResult};
-use zenoh_sync::RecyclingObjectPool;
-#[cfg(feature = "unstable")]
-use zenoh_sync::{event, Notifier, Waiter};
+use zenoh_sync::{event, Notifier, RecyclingObjectPool, Waiter};
 use zenoh_task::TaskController;
+
+/// Prototype: bounded depth of each per-(link, priority) tx queue used for
+/// slow-subscriber isolation. Hardcoded for now.
+const TX_QUEUE_LEN: usize = 8;
 
 use super::transport::TransportUnicastUniversal;
 use crate::{
@@ -48,21 +52,79 @@ use crate::{
     unicast::link::{TransportLinkUnicast, TransportLinkUnicastRx, TransportLinkUnicastTx},
 };
 
+/// A bounded per-(link, priority) queue used as a staging buffer between the
+/// shared fan-out path and the per-link transmission pipeline.
+///
+/// Prototype for slow-subscriber isolation: `internal_schedule` enqueues here
+/// (non-blocking, drop-oldest on overflow) instead of pushing into the pipeline
+/// inline. A dedicated per-link drain worker (see [`tx_queue_drain_loop`])
+/// performs the potentially-blocking push into the pipeline, so a congested
+/// link can no longer stall delivery to other links.
+struct TxQueueInner {
+    queues: [Mutex<VecDeque<NetworkMessage>>; Priority::NUM],
+    disabled: AtomicBool,
+}
+
+#[derive(Clone)]
+pub(super) struct TxQueue {
+    inner: Arc<TxQueueInner>,
+    notifier: Notifier,
+    waiter: Waiter,
+}
+
+impl TxQueue {
+    fn new() -> Self {
+        let (notifier, waiter) = event::new();
+        Self {
+            inner: Arc::new(TxQueueInner {
+                queues: std::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(TX_QUEUE_LEN))),
+                disabled: AtomicBool::new(false),
+            }),
+            notifier,
+            waiter,
+        }
+    }
+
+    /// Non-blocking enqueue with drop-oldest overflow policy.
+    pub(super) fn enqueue(&self, msg: NetworkMessage) {
+        // Guard the index in case the link is non-QoS (single priority).
+        let idx = (msg.priority() as usize).min(Priority::NUM - 1);
+        {
+            let mut q = self.inner.queues[idx]
+                .lock()
+                .expect("locking `TxQueue` should not fail");
+            if q.len() >= TX_QUEUE_LEN {
+                // Drop the oldest message to make room for the freshest one.
+                q.pop_front();
+            }
+            q.push_back(msg);
+        }
+        let _ = self.notifier.notify();
+    }
+
+    fn pop(&self, prio: usize) -> Option<NetworkMessage> {
+        self.inner.queues[prio]
+            .lock()
+            .expect("locking `TxQueue` should not fail")
+            .pop_front()
+    }
+
+    fn disable(&self) {
+        self.inner.disabled.store(true, Ordering::Release);
+        let _ = self.notifier.notify();
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct TransportLinkUnicastUniversal {
     // The underlying link
     pub(super) link: TransportLinkUnicast,
     // The transmission pipeline
     pub(super) pipeline: TransmissionPipelineProducer,
+    // Bounded per-(link, priority) staging queue feeding the pipeline
+    pub(super) tx_queue: TxQueue,
     // The task handling substruct
     task_controller: TaskController,
-    #[cfg(feature = "unstable")]
-    // Notifier for a BlockFirst message to be ready to be sent
-    // (after the previous one has been sent)
-    pub block_first_notifiers: [Notifier; Priority::NUM],
-    #[cfg(feature = "unstable")]
-    // Waiter for a BlockFirst message to be ready to be sent
-    pub block_first_waiters: [Waiter; Priority::NUM],
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::LinkStats,
 }
@@ -103,27 +165,11 @@ impl TransportLinkUnicastUniversal {
             .stats
             .link_stats(&link_unicast.src, &link_unicast.dst);
 
-        #[cfg(feature = "unstable")]
-        let mut block_first_notifiers = Vec::new();
-        #[cfg(feature = "unstable")]
-        let mut block_first_waiters = Vec::new();
-        #[cfg(feature = "unstable")]
-        for _ in 0..Priority::NUM {
-            let (notifier, waiter) = event::new();
-            // notify to be make the BlockFirst "slot" available
-            notifier.notify().unwrap();
-            block_first_notifiers.push(notifier);
-            block_first_waiters.push(waiter);
-        }
-
         let result = Self {
             link,
             pipeline: producer,
+            tx_queue: TxQueue::new(),
             task_controller: TaskController::default(),
-            #[cfg(feature = "unstable")]
-            block_first_notifiers: block_first_notifiers.try_into().ok().unwrap(),
-            #[cfg(feature = "unstable")]
-            block_first_waiters: block_first_waiters.try_into().ok().unwrap(),
             #[cfg(feature = "stats")]
             stats,
         };
@@ -137,6 +183,29 @@ impl TransportLinkUnicastUniversal {
         consumer: TransmissionPipelineConsumer,
         keep_alive: Duration,
     ) {
+        // Spawn the per-link TxQueue drain worker on a dedicated thread.
+        // It performs the (potentially blocking) push into the pipeline so that
+        // a congested link only stalls its own worker, not the shared fan-out.
+        {
+            let tx_queue = self.tx_queue.clone();
+            let pipeline = self.pipeline.clone();
+            let drain_transport = transport.clone();
+            #[cfg(feature = "stats")]
+            let stats = self.stats.clone();
+            std::thread::Builder::new()
+                .name("zenoh-tx-queue".into())
+                .spawn(move || {
+                    tx_queue_drain_loop(
+                        tx_queue,
+                        pipeline,
+                        drain_transport,
+                        #[cfg(feature = "stats")]
+                        stats,
+                    )
+                })
+                .expect("spawning `zenoh-tx-queue` drain thread should not fail");
+        }
+
         // Spawn the TX task
         let mut tx = self.link.tx();
         #[cfg(feature = "stats")]
@@ -218,6 +287,7 @@ impl TransportLinkUnicastUniversal {
 
     pub(super) async fn close(self) -> ZResult<()> {
         tracing::trace!("{}: closing", self.link);
+        self.tx_queue.disable();
         self.task_controller.terminate_all_async().await;
         self.pipeline.disable();
 
@@ -228,6 +298,42 @@ impl TransportLinkUnicastUniversal {
 /*************************************/
 /*              TASKS                */
 /*************************************/
+/// Per-link drain worker: pops messages from the bounded per-priority
+/// [`TxQueue`] in strict priority order (Control first) and pushes them into
+/// the transmission pipeline. The push may block when the link is congested,
+/// but it only blocks this dedicated worker thread, isolating other links.
+fn tx_queue_drain_loop(
+    tx_queue: TxQueue,
+    pipeline: TransmissionPipelineProducer,
+    transport: TransportUnicastUniversal,
+    #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
+) {
+    loop {
+        // Block until there is something to drain (or the queue is dropped).
+        if tx_queue.waiter.wait().is_err() {
+            break;
+        }
+        if tx_queue.inner.disabled.load(Ordering::Acquire) {
+            break;
+        }
+        // Strict priority: index 0 (Control) is the highest priority.
+        for prio in 0..Priority::NUM {
+            while let Some(msg) = tx_queue.pop(prio) {
+                match pipeline.push_network_message(msg.as_ref()) {
+                    Ok(pushed) => transport.handle_push_result(
+                        msg.as_ref(),
+                        pushed,
+                        #[cfg(feature = "stats")]
+                        stats.clone(),
+                    ),
+                    // The transport has been closed: stop draining.
+                    Err(_closed) => return,
+                }
+            }
+        }
+    }
+}
+
 async fn tx_task(
     pipeline: TransmissionPipelineConsumer,
     link: &mut TransportLinkUnicastTx,

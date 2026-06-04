@@ -12,8 +12,6 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-#[cfg(feature = "unstable")]
-use zenoh_protocol::core::CongestionControl;
 use zenoh_protocol::{
     core::{Priority, PriorityRange, Reliability},
     network::{NetworkMessageExt, NetworkMessageMut, NetworkMessageRef},
@@ -72,7 +70,7 @@ impl TransportUnicastUniversal {
         match_.full.or(match_.partial).or(match_.any)
     }
 
-    fn handle_push_result(
+    pub(super) fn handle_push_result(
         &self,
         msg: NetworkMessageRef,
         pushed: bool,
@@ -146,7 +144,6 @@ impl TransportUnicastUniversal {
             .get(transport_link_index)
             .expect("transport link index should be valid");
 
-        let pipeline = transport_link.pipeline.clone();
         tracing::trace!(
             "Scheduled {:?} for transmission to {} ({})",
             msg,
@@ -154,53 +151,19 @@ impl TransportUnicastUniversal {
             self.get_zid()
         );
 
-        #[cfg(feature = "stats")]
-        let stats = transport_link.stats.clone();
+        // Prototype slow-subscriber isolation: instead of pushing into the
+        // transmission pipeline inline (which can block this shared fan-out
+        // thread for a long time when the link is congested), enqueue the
+        // message into the bounded per-(link, priority) queue. A dedicated
+        // per-link drain worker performs the (potentially blocking) push into
+        // the pipeline, so a slow link can no longer stall delivery to others.
+        let owned = NetworkMessageExt::to_owned(&msg);
+        transport_link.tx_queue.enqueue(owned);
 
-        #[cfg(feature = "unstable")]
-        if msg.congestion_control() == CongestionControl::BlockFirst {
-            let priority = msg.priority();
-            if transport_link.block_first_waiters[priority as usize]
-                .wait_timeout(self.manager.config.wait_before_drop)
-                .is_err()
-            {
-                #[cfg(feature = "stats")]
-                stats.tx_observe_congestion(msg);
-                return Ok(false);
-            };
-            let transport = self.clone();
-            let block_first_notifier =
-                transport_link.block_first_notifiers[priority as usize].clone();
-            let msg = NetworkMessageExt::to_owned(&msg);
-            zenoh_runtime::ZRuntime::Net.spawn_blocking(move || {
-                let msg = msg.as_ref();
-                if let Ok(pushed) = pipeline.push_network_message(msg) {
-                    transport.handle_push_result(
-                        msg,
-                        pushed,
-                        #[cfg(feature = "stats")]
-                        stats,
-                    );
-                }
-                let _ = block_first_notifier.notify();
-            });
-            // Message should be sent as it is blocking.
-            return Ok(true);
-        }
-
-        // Drop the guard before the push_zenoh_message since
-        // the link could be congested and this operation could
-        // block for fairly long time
+        // Drop the guard once the message has been handed off.
         drop(transport_links);
 
-        let pushed = pipeline.push_network_message(msg)?;
-        self.handle_push_result(
-            msg,
-            pushed,
-            #[cfg(feature = "stats")]
-            stats,
-        );
-        Ok(pushed)
+        Ok(true)
     }
 }
 
