@@ -16,7 +16,7 @@ use std::{
     future::poll_fn,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     task::Poll,
     time::{Duration, Instant},
@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zenoh_link::Link;
 use zenoh_protocol::{
-    core::Priority,
+    core::{CongestionControl, Priority},
     network::{NetworkMessage, NetworkMessageExt},
     transport::{KeepAlive, TransportMessage},
 };
@@ -35,9 +35,31 @@ use zenoh_result::{bail, zerror, ZResult};
 use zenoh_sync::{event, Notifier, RecyclingObjectPool, Waiter};
 use zenoh_task::TaskController;
 
-/// Prototype: bounded depth of each per-(link, priority) tx queue used for
-/// slow-subscriber isolation. Hardcoded for now.
-const TX_QUEUE_LEN: usize = 8;
+/// Prototype: default bounded depth of each per-(link, priority) tx queue used
+/// for slow-subscriber isolation. Overridable at runtime via the
+/// `ZENOH_TX_QUEUE_LEN` environment variable.
+const DEFAULT_TX_QUEUE_LEN: usize = 8;
+
+/// Name of the environment variable controlling the per-(link, priority) tx
+/// queue depth.
+const TX_QUEUE_LEN_ENV: &str = "ZENOH_TX_QUEUE_LEN";
+
+/// Resolve the tx queue depth from the `ZENOH_TX_QUEUE_LEN` environment
+/// variable, falling back to [`DEFAULT_TX_QUEUE_LEN`] when unset or invalid.
+fn tx_queue_len() -> usize {
+    match std::env::var(TX_QUEUE_LEN_ENV) {
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                println!(
+                    "[zenoh-tx-queue] invalid {TX_QUEUE_LEN_ENV}={v:?}, falling back to default {DEFAULT_TX_QUEUE_LEN}"
+                );
+                DEFAULT_TX_QUEUE_LEN
+            }
+        },
+        Err(_) => DEFAULT_TX_QUEUE_LEN,
+    }
+}
 
 use super::transport::TransportUnicastUniversal;
 use crate::{
@@ -52,16 +74,43 @@ use crate::{
     unicast::link::{TransportLinkUnicast, TransportLinkUnicastRx, TransportLinkUnicastTx},
 };
 
+/// Returns `true` if a message must be transmitted without ever being dropped,
+/// i.e. it is allowed to exert backpressure (block) on a full queue.
+///
+/// Only reliable `CongestionControl::Block` traffic blocks. Everything else —
+/// best-effort, `CongestionControl::Drop`, and `CongestionControl::BlockFirst`
+/// — is evictable and never blocks the enqueuing thread.
+#[inline]
+fn may_block(msg: &impl NetworkMessageExt) -> bool {
+    msg.is_reliable() && msg.congestion_control() == CongestionControl::Block
+}
+
 /// A bounded per-(link, priority) queue used as a staging buffer between the
 /// shared fan-out path and the per-link transmission pipeline.
 ///
 /// Prototype for slow-subscriber isolation: `internal_schedule` enqueues here
-/// (non-blocking, drop-oldest on overflow) instead of pushing into the pipeline
-/// inline. A dedicated per-link drain worker (see [`tx_queue_drain_loop`])
-/// performs the potentially-blocking push into the pipeline, so a congested
-/// link can no longer stall delivery to other links.
+/// instead of pushing into the pipeline inline. A dedicated per-link drain
+/// worker (see [`tx_queue_drain_loop`]) performs the potentially-blocking push
+/// into the pipeline, so a congested link can no longer stall delivery to other
+/// links.
+///
+/// Overflow policy preserves Zenoh's reliability guarantees: only messages that
+/// are *not* reliable `Block` (i.e. best-effort, `Drop`, or `BlockFirst`) are
+/// ever discarded. Reliable `Block` messages (e.g. `Declare` traffic) are never
+/// dropped; when a priority queue is saturated exclusively with such messages,
+/// the enqueuing thread blocks (backpressure) until the drain worker frees a
+/// slot.
+struct PriorityQueue {
+    queue: Mutex<VecDeque<NetworkMessage>>,
+    /// Signalled by the drain worker whenever it frees a slot, so blocked
+    /// enqueuers waiting for space can make progress.
+    space: Condvar,
+}
+
 struct TxQueueInner {
-    queues: [Mutex<VecDeque<NetworkMessage>>; Priority::NUM],
+    queues: [PriorityQueue; Priority::NUM],
+    /// Maximum depth of each per-priority queue (from `ZENOH_TX_QUEUE_LEN`).
+    capacity: usize,
     disabled: AtomicBool,
 }
 
@@ -74,10 +123,19 @@ pub(super) struct TxQueue {
 
 impl TxQueue {
     fn new() -> Self {
+        let capacity = tx_queue_len();
+        println!(
+            "[zenoh-tx-queue] creating TxQueue with capacity {capacity} per (link, priority) \
+             (env {TX_QUEUE_LEN_ENV})"
+        );
         let (notifier, waiter) = event::new();
         Self {
             inner: Arc::new(TxQueueInner {
-                queues: std::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(TX_QUEUE_LEN))),
+                queues: std::array::from_fn(|_| PriorityQueue {
+                    queue: Mutex::new(VecDeque::with_capacity(capacity)),
+                    space: Condvar::new(),
+                }),
+                capacity,
                 disabled: AtomicBool::new(false),
             }),
             notifier,
@@ -85,17 +143,50 @@ impl TxQueue {
         }
     }
 
-    /// Non-blocking enqueue with drop-oldest overflow policy.
+    /// Enqueue a message into its priority queue.
+    ///
+    /// Overflow handling never drops a reliable `Block` message:
+    /// - If the queue is full, the oldest evictable (non-`Block`) message is
+    ///   dropped to make room.
+    /// - If the queue is full and contains only reliable `Block` messages:
+    ///   - a non-`Block` incoming message is dropped (returns without pushing);
+    ///   - a reliable `Block` incoming message blocks until the drain worker
+    ///     frees a slot (backpressure).
     pub(super) fn enqueue(&self, msg: NetworkMessage) {
         // Guard the index in case the link is non-QoS (single priority).
         let idx = (msg.priority() as usize).min(Priority::NUM - 1);
+        let pq = &self.inner.queues[idx];
+        let capacity = self.inner.capacity;
+        let blocking = may_block(&msg);
         {
-            let mut q = self.inner.queues[idx]
+            let mut q = pq
+                .queue
                 .lock()
                 .expect("locking `TxQueue` should not fail");
-            if q.len() >= TX_QUEUE_LEN {
-                // Drop the oldest message to make room for the freshest one.
-                q.pop_front();
+            loop {
+                if q.len() < capacity {
+                    break;
+                }
+                // Full: try to evict the oldest non-`Block` message to make room.
+                if let Some(pos) = q.iter().position(|m| !may_block(m)) {
+                    q.remove(pos);
+                    break;
+                }
+                // Queue is saturated with reliable `Block` messages.
+                if !blocking {
+                    // Cannot make room without dropping a `Block` message:
+                    // drop the incoming non-`Block` one instead.
+                    return;
+                }
+                if self.inner.disabled.load(Ordering::Acquire) {
+                    // Link is shutting down: stop blocking and discard.
+                    return;
+                }
+                // Backpressure: wait until the drain worker frees a slot.
+                q = pq
+                    .space
+                    .wait(q)
+                    .expect("waiting on `TxQueue` should not fail");
             }
             q.push_back(msg);
         }
@@ -103,14 +194,25 @@ impl TxQueue {
     }
 
     fn pop(&self, prio: usize) -> Option<NetworkMessage> {
-        self.inner.queues[prio]
+        let pq = &self.inner.queues[prio];
+        let msg = pq
+            .queue
             .lock()
             .expect("locking `TxQueue` should not fail")
-            .pop_front()
+            .pop_front();
+        if msg.is_some() {
+            // A slot was freed: wake an enqueuer blocked on backpressure.
+            pq.space.notify_one();
+        }
+        msg
     }
 
     fn disable(&self) {
         self.inner.disabled.store(true, Ordering::Release);
+        // Wake the drain worker and any enqueuers blocked on backpressure.
+        for pq in &self.inner.queues {
+            pq.space.notify_all();
+        }
         let _ = self.notifier.notify();
     }
 }
