@@ -100,6 +100,10 @@ name = "z_querier"
 path = "examples/z_querier.rs"
 
 [[example]]
+name = "z_querier_deadlock"
+path = "examples/z_querier_deadlock.rs"
+
+[[example]]
 name = "z_queryable"
 path = "examples/z_queryable.rs"
 
