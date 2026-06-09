@@ -12,10 +12,10 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::poll_fn,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, OnceLock,
     },
     task::Poll,
@@ -27,8 +27,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zenoh_link::Link;
 use zenoh_protocol::{
-    core::{CongestionControl, Priority},
-    network::{NetworkMessage, NetworkMessageExt},
+    core::{CongestionControl, ExprId, Priority, WireExpr},
+    network::{declare::DeclareBody, NetworkBodyRef, NetworkMessage, NetworkMessageExt},
     transport::{KeepAlive, TransportMessage},
 };
 use zenoh_result::{bail, zerror, ZResult};
@@ -93,6 +93,37 @@ fn may_block(msg: &impl NetworkMessageExt) -> bool {
     msg.is_reliable() && msg.congestion_control() == CongestionControl::Block
 }
 
+/// Optional key-expression substring filters for the tx-queue instrumentation,
+/// read once from the `ZENOH_TX_QUEUE_FILTER` environment variable. The value
+/// is a comma-separated list of substrings; a message matches if its (resolved)
+/// key expression contains *any* of them. When set, only matching messages are
+/// counted, and only links carrying such traffic print stats.
+fn tx_queue_filter() -> Option<&'static [String]> {
+    static FILTER: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| match std::env::var("ZENOH_TX_QUEUE_FILTER") {
+            Ok(v) => {
+                let patterns: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                if patterns.is_empty() {
+                    None
+                } else {
+                    println!(
+                        "[zenoh-tx-queue] tracking only key exprs containing any of {patterns:?} \
+                         (env ZENOH_TX_QUEUE_FILTER)"
+                    );
+                    Some(patterns)
+                }
+            }
+            Err(_) => None,
+        })
+        .as_deref()
+}
+
 /// A bounded per-(link, priority) queue used as a staging buffer between the
 /// shared fan-out path and the per-link transmission pipeline.
 ///
@@ -120,6 +151,20 @@ struct TxQueueInner {
     /// Maximum depth of each per-priority queue (from `ZENOH_TX_QUEUE_LEN`).
     capacity: usize,
     disabled: AtomicBool,
+    // Instrumentation counters (reset each time the drain worker prints).
+    /// Messages successfully pushed into the queue by `enqueue`.
+    enqueued: AtomicUsize,
+    /// Oldest evictable messages discarded to make room on overflow.
+    evicted: AtomicUsize,
+    /// Incoming messages discarded because the queue was saturated with
+    /// reliable `Block` traffic.
+    dropped: AtomicUsize,
+    /// Reverse map (numeric `ExprId` -> resolved key expression string), built
+    /// by snooping outgoing `DeclareKeyExpr` messages on this link. Lets the
+    /// `ZENOH_TX_QUEUE_FILTER` match optimized `WireExpr`s (numeric id, empty
+    /// suffix) that carry no literal key string on the wire. Only populated
+    /// when a filter is configured.
+    keyexpr_map: Mutex<HashMap<ExprId, String>>,
 }
 
 #[derive(Clone)]
@@ -145,9 +190,68 @@ impl TxQueue {
                 }),
                 capacity,
                 disabled: AtomicBool::new(false),
+                enqueued: AtomicUsize::new(0),
+                evicted: AtomicUsize::new(0),
+                dropped: AtomicUsize::new(0),
+                keyexpr_map: Mutex::new(HashMap::new()),
             }),
             notifier,
             waiter,
+        }
+    }
+
+    /// Snoop an outgoing `DeclareKeyExpr` to record its `ExprId -> keyexpr`
+    /// mapping, so later optimized `WireExpr`s on this link can be resolved
+    /// back to a full key string for filtering. No-op unless
+    /// `ZENOH_TX_QUEUE_FILTER` is set.
+    fn record_keyexpr(&self, msg: &NetworkMessage) {
+        if tx_queue_filter().is_none() {
+            return;
+        }
+        if let NetworkBodyRef::Declare(declare) = msg.body() {
+            if let DeclareBody::DeclareKeyExpr(dke) = &declare.body {
+                // Resolve first (locks the map) then insert (locks again): the
+                // std `Mutex` is not re-entrant.
+                let resolved = self.resolve(&dke.wire_expr);
+                self.inner
+                    .keyexpr_map
+                    .lock()
+                    .expect("locking `TxQueue` keyexpr map should not fail")
+                    .insert(dke.id, resolved);
+            }
+        }
+    }
+
+    /// Resolve a (possibly optimized) `WireExpr` to its full key expression
+    /// string using the snooped `ExprId -> keyexpr` map. A non-zero scope that
+    /// is not (yet) known is rendered as `{id:N}`.
+    fn resolve(&self, we: &WireExpr) -> String {
+        let mut s = if we.scope == 0 {
+            String::new()
+        } else {
+            self.inner
+                .keyexpr_map
+                .lock()
+                .expect("locking `TxQueue` keyexpr map should not fail")
+                .get(&we.scope)
+                .cloned()
+                .unwrap_or_else(|| format!("{{id:{}}}", we.scope))
+        };
+        s.push_str(&we.suffix);
+        s
+    }
+
+    /// Whether `msg` should be counted by the instrumentation: always `true`
+    /// when no `ZENOH_TX_QUEUE_FILTER` is set, otherwise `true` only when the
+    /// resolved key expression contains at least one of the configured
+    /// substrings.
+    fn tracked(&self, msg: &NetworkMessage) -> bool {
+        match tx_queue_filter() {
+            None => true,
+            Some(filters) => msg.wire_expr().is_some_and(|we| {
+                let resolved = self.resolve(we);
+                filters.iter().any(|f| resolved.contains(f))
+            }),
         }
     }
 
@@ -166,6 +270,8 @@ impl TxQueue {
         let pq = &self.inner.queues[idx];
         let capacity = self.inner.capacity;
         let blocking = may_block(&msg);
+        // Snoop key-expr declarations so optimized `WireExpr`s can be resolved.
+        self.record_keyexpr(&msg);
         {
             let mut q = pq
                 .queue
@@ -177,13 +283,20 @@ impl TxQueue {
                 }
                 // Full: try to evict the oldest non-`Block` message to make room.
                 if let Some(pos) = q.iter().position(|m| !may_block(m)) {
-                    q.remove(pos);
+                    if let Some(removed) = q.remove(pos) {
+                        if self.tracked(&removed) {
+                            self.inner.evicted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     break;
                 }
                 // Queue is saturated with reliable `Block` messages.
                 if !blocking {
                     // Cannot make room without dropping a `Block` message:
                     // drop the incoming non-`Block` one instead.
+                    if self.tracked(&msg) {
+                        self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     return;
                 }
                 if self.inner.disabled.load(Ordering::Acquire) {
@@ -196,9 +309,33 @@ impl TxQueue {
                     .wait(q)
                     .expect("waiting on `TxQueue` should not fail");
             }
+            if self.tracked(&msg) {
+                self.inner.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
             q.push_back(msg);
         }
         let _ = self.notifier.notify();
+    }
+
+    /// Snapshot and reset the instrumentation counters, returning
+    /// `(enqueued, evicted, dropped, current_depth)` accumulated since the
+    /// previous call.
+    fn take_stats(&self) -> (usize, usize, usize, usize) {
+        let enqueued = self.inner.enqueued.swap(0, Ordering::Relaxed);
+        let evicted = self.inner.evicted.swap(0, Ordering::Relaxed);
+        let dropped = self.inner.dropped.swap(0, Ordering::Relaxed);
+        let depth: usize = self
+            .inner
+            .queues
+            .iter()
+            .map(|pq| {
+                pq.queue
+                    .lock()
+                    .expect("locking `TxQueue` should not fail")
+                    .len()
+            })
+            .sum();
+        (enqueued, evicted, dropped, depth)
     }
 
     fn pop(&self, prio: usize) -> Option<NetworkMessage> {
@@ -300,6 +437,7 @@ impl TransportLinkUnicastUniversal {
             let tx_queue = self.tx_queue.clone();
             let pipeline = self.pipeline.clone();
             let drain_transport = transport.clone();
+            let dst = self.link.link.get_dst().to_string();
             #[cfg(feature = "stats")]
             let stats = self.stats.clone();
             std::thread::Builder::new()
@@ -309,6 +447,7 @@ impl TransportLinkUnicastUniversal {
                         tx_queue,
                         pipeline,
                         drain_transport,
+                        dst,
                         #[cfg(feature = "stats")]
                         stats,
                     )
@@ -416,8 +555,14 @@ fn tx_queue_drain_loop(
     tx_queue: TxQueue,
     pipeline: TransmissionPipelineProducer,
     transport: TransportUnicastUniversal,
+    dst: String,
     #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
 ) {
+    // Instrumentation: per-second rate readout to localize where a stream
+    // collapses. `drained` is counted locally; the rest come from `TxQueue`.
+    let mut drained: usize = 0;
+    let mut blocked_nanos: u128 = 0;
+    let mut last_print = Instant::now();
     loop {
         // Block until there is something to drain (or the queue is dropped).
         if tx_queue.waiter.wait().is_err() {
@@ -429,17 +574,50 @@ fn tx_queue_drain_loop(
         // Strict priority: index 0 (Control) is the highest priority.
         for prio in 0..Priority::NUM {
             while let Some(msg) = tx_queue.pop(prio) {
-                match pipeline.push_network_message(msg.as_ref()) {
-                    Ok(pushed) => transport.handle_push_result(
-                        msg.as_ref(),
-                        pushed,
-                        #[cfg(feature = "stats")]
-                        stats.clone(),
-                    ),
+                // Time spent inside the (potentially blocking) pipeline push:
+                // high values here mean this link's egress is the bottleneck.
+                let is_tracked = tx_queue.tracked(&msg);
+                let push_start = Instant::now();
+                let res = pipeline.push_network_message(msg.as_ref());
+                blocked_nanos += push_start.elapsed().as_nanos();
+                match res {
+                    Ok(pushed) => {
+                        if is_tracked {
+                            drained += 1;
+                        }
+                        transport.handle_push_result(
+                            msg.as_ref(),
+                            pushed,
+                            #[cfg(feature = "stats")]
+                            stats.clone(),
+                        )
+                    }
                     // The transport has been closed: stop draining.
                     Err(_closed) => return,
                 }
             }
+        }
+        let elapsed = last_print.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let (enq, evi, drp, depth) = tx_queue.take_stats();
+            // Only print links that actually carried counted traffic this
+            // interval. With `ZENOH_TX_QUEUE_FILTER` set this hides every link
+            // that did not forward the tracked key expression.
+            if enq + evi + drp + drained > 0 {
+                let secs = elapsed.as_secs_f64();
+                let blocked_ms = blocked_nanos as f64 / 1e6;
+                println!(
+                    "[zenoh-tx-queue] link={dst} enq={:.0}/s drained={:.0}/s evicted={:.0}/s \
+                     dropped={:.0}/s depth={depth} push_blocked={blocked_ms:.0}ms/s",
+                    enq as f64 / secs,
+                    drained as f64 / secs,
+                    evi as f64 / secs,
+                    drp as f64 / secs,
+                );
+            }
+            drained = 0;
+            blocked_nanos = 0;
+            last_print = Instant::now();
         }
     }
 }
