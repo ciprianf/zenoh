@@ -49,7 +49,10 @@ const TX_QUEUE_LEN_ENV: &str = "ZENOH_TX_QUEUE_LEN";
 fn tx_queue_len() -> usize {
     match std::env::var(TX_QUEUE_LEN_ENV) {
         Ok(v) => match v.parse::<usize>() {
-            Ok(n) if n > 0 => n,
+            Ok(n) if n > 0 => {
+                println!("[zenoh-tx-queue] {TX_QUEUE_LEN_ENV}={v:?} -> using queue length {n}");
+                n
+            }
             _ => {
                 println!(
                     "[zenoh-tx-queue] invalid {TX_QUEUE_LEN_ENV}={v:?}, falling back to default {DEFAULT_TX_QUEUE_LEN}"
@@ -57,7 +60,12 @@ fn tx_queue_len() -> usize {
                 DEFAULT_TX_QUEUE_LEN
             }
         },
-        Err(_) => DEFAULT_TX_QUEUE_LEN,
+        Err(_) => {
+            println!(
+                "[zenoh-tx-queue] {TX_QUEUE_LEN_ENV} not set, using default queue length {DEFAULT_TX_QUEUE_LEN}"
+            );
+            DEFAULT_TX_QUEUE_LEN
+        }
     }
 }
 
